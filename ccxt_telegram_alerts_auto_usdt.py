@@ -3,22 +3,26 @@
 
 """
 CCXT Crypto Alerts -> Telegram (auto-select Binance USDT pairs by liquidity)
-v4-clean: стабильная версия с:
+v4: стабильная версия с:
 - антиспамом (--cooldown_min, --only_change)
 - фильтром тихих сетапов (--min_atr_pct)
-- динамической точностью цен
+- динамической точностью цен и форматами
 - сопровождением позиций (--manage trail по EMA20)
-- оценкой силы сетапа в алертах и статистике
-- paper-trade с динамическим риском по score (3/6/9/15%)
-- трейдерской статой: Balance / Used / Free / Equity + Realized / Unrealized
-- сохранением/восстановлением состояния (paper_state.json, --reset_paper)
-- исключением стабильных базовых активов (USDC, FDUSD и т.п.)
-- минимальным порогом стоимости позиции (--min_cost_usd), защита от qty=0/cost=0
+- оценкой силы сетапа (score) в алертах и статистике
+- paper-trade:
+   * режим size = риск по стопу (default: --sizing risk --risk_pct 3.0)
+   * альтернативно size = аллокация капитала (--sizing alloc с 3/6/9/15% от силы сетапа)
+   * поддержка фьюч-логики: --futures_margin --leverage 100 (списывается маржа; Equity = bank+realized+unreal)
+- трейдерская стата: Balance / Used / Free / Equity + Realized / Unrealized
+- сохранение/восстановление состояния (paper_state.json, --reset_paper)
+- исключение стейблов (USDC, FDUSD и т.п.) из базовой монеты
+- порог минимального размера входа (--min_cost_usd)
+- безопасные сообщения в Telegram (HTML-escape)
 """
 
-import os, sys, time, argparse, hashlib, re, json, html
+import os, sys, time, argparse, re, json, html
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Set, Optional
+from typing import List, Tuple, Dict, Optional
 import pandas as pd
 import numpy as np
 
@@ -151,11 +155,22 @@ def ensure_exchange(name: str):
     ex.load_markets()
     return ex
 
+
+def with_retries(fn, *a, retries=3, base_delay=0.5, **kw):
+    for i in range(retries + 1):
+        try:
+            return fn(*a, **kw)
+        except Exception:
+            if i == retries:
+                raise
+            time.sleep(base_delay * (2 ** i))
+
+
 def fetch_ohlcv_paged(ex, symbol: str, timeframe: str, limit_total: int) -> List[List]:
     out = []; since = None
     per_call = 1000 if ex.has.get('fetchOHLCV', False) else 500
     while len(out) < limit_total:
-        batch = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=per_call)
+        batch = with_retries(ex.fetch_ohlcv, symbol, timeframe=timeframe, since=since, limit=per_call)
         if not batch: break
         if out and batch[0][0] <= out[-1][0]:
             batch = [b for b in batch if b[0] > out[-1][0]]
@@ -187,7 +202,7 @@ STABLE_BASES = {
 def list_usdt_markets_by_volume(ex, min_quote_usd: float, limit: int, spot_only: bool = True) -> List[str]:
     if not ex.has.get('fetchTickers', False):
         raise RuntimeError('Exchange does not support fetchTickers for volume filtering.')
-    tickers = ex.fetch_tickers(); rows = []
+    tickers = with_retries(ex.fetch_tickers); rows = []
     for sym, t in tickers.items():
         try:
             market = ex.market(sym)
@@ -228,6 +243,24 @@ def tg_send(token: str, chat_id: str, text: str) -> bool:
         print('[warn] Telegram exception:', e, file=sys.stderr)
         return False
 
+
+def tg_safe_send(token: str, chat_id: str, text: str) -> bool:
+    if requests is None:
+        print('[warn] requests not installed; cannot send Telegram messages.', file=sys.stderr)
+        return False
+    url = f'https://api.telegram.org/bot{token}/sendMessage'
+    try:
+        r = requests.post(url, json={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}, timeout=20)
+        ok = (r.status_code == 200) and r.json().get('ok', False)
+        if not ok:
+            print('[warn] Telegram send failed:', r.text[:200], file=sys.stderr)
+        time.sleep(0.35)
+        return ok
+    except Exception as e:
+        print('[warn] Telegram exception:', e, file=sys.stderr)
+        return False
+
+
 def _decimals_for_price(p: float) -> int:
     if p <= 0: return 6
     if p < 0.0001: return 9
@@ -242,7 +275,6 @@ def fmt_price(p: float) -> str:
 
 def fmt_qty(q: float) -> str:
     if q <= 0: return '0.000000'
-    # подстраиваем точность по величине
     if q < 0.001: return f'{q:.8f}'
     if q < 1:     return f'{q:.6f}'
     if q < 100:   return f'{q:.4f}'
@@ -351,7 +383,7 @@ def llm_explain(llm_url: str, llm_key: str, payload: Dict) -> str:
     except Exception:
         return ""
 
-# ===================== Paper trading (spot) =====================
+# ===================== Paper trading (spot/futures-like) =====================
 
 @dataclass
 class Position:
@@ -364,6 +396,7 @@ class Position:
     qty: float
     score: int = 0
     cost_initial: float = 0.0
+    margin_initial: float = 0.0
     filled_tp1: bool = False
     closed: bool = False
     realized_pnl: float = 0.0
@@ -379,11 +412,10 @@ def entries_and_targets(direction: str, df: pd.DataFrame, cfg: SignalConfig) -> 
     return entry, stop, tp1, tp2
 
 def simulate_fill(pos: Position, price: float) -> float:
-    """Симуляция исполнения. Возвращает delta кэша (для LONG); SHORT считаем без кэш-перетоков."""
+    """Симуляция частичных выходов. Возвращает cash_delta для СПОТ (LONG). Для futures_margin — игнорируйте."""
     if pos.closed:
         return 0.0
     cash_delta = 0.0
-    # LONG
     if pos.direction == 'LONG':
         if not pos.filled_tp1 and ((price >= pos.tp1) or (price <= pos.stop)):
             if price >= pos.tp1:
@@ -414,7 +446,8 @@ def simulate_fill(pos: Position, price: float) -> float:
                 pos.realized_pnl += pnl
                 pos.closed = True
                 return cash_delta
-    else:  # SHORT — кэш не двигаем (упрощение)
+    else:
+        # SHORT — для простоты считаем только PnL, кэш не двигаем
         if not pos.filled_tp1 and ((price <= pos.tp1) or (price >= pos.stop)):
             if price <= pos.tp1:
                 pnl = (pos.entry - pos.tp1) * (pos.qty * 0.5)
@@ -476,8 +509,11 @@ def main():
     # paper trading
     parser.add_argument('--paper_trade', action='store_true')
     parser.add_argument('--bank_start', type=float, default=10000.0)
-    parser.add_argument('--risk_pct', type=float, default=1.0, help='(Не используется при динамическом риске, оставлен для совместимости)')
-    parser.add_argument('--min_cost_usd', type=float, default=10.0, help='Минимальная стоимость позиции для открытия (paper)')
+    parser.add_argument('--sizing', type=str, default='risk', choices=['risk','alloc'], help='risk: фикс % риска по стопу; alloc: % аллокации капитала')
+    parser.add_argument('--risk_pct', type=float, default=1.0, help='Процент риска от банка на сделку (для sizing=risk)')
+    parser.add_argument('--leverage', type=float, default=1.0, help='Плечо (для учёта маржи при futures-режиме)')
+    parser.add_argument('--futures_margin', action='store_true', help='Считать маржу как cost/leverage вместо списания всей стоимости (spot)')
+    parser.add_argument('--min_cost_usd', type=float, default=10.0, help='Минимальная стоимость позиции/маржи для открытия (paper)')
     parser.add_argument('--tg_token', type=str, default=os.getenv('TELEGRAM_BOT_TOKEN',''))
     parser.add_argument('--tg_chat', type=str, default=os.getenv('TELEGRAM_CHAT_ID',''))
     parser.add_argument('--log_csv', type=str, default='ccxt_alerts_log.csv')
@@ -526,6 +562,7 @@ def main():
                         'qty': p.qty,
                         'score': p.score,
                         'cost_initial': p.cost_initial,
+                        'margin_initial': p.margin_initial,
                         'filled_tp1': p.filled_tp1,
                         'closed': p.closed,
                         'realized_pnl': p.realized_pnl,
@@ -557,6 +594,7 @@ def main():
                     qty=float(d['qty']),
                     score=int(d.get('score',0)),
                     cost_initial=float(d.get('cost_initial',0.0)),
+                    margin_initial=float(d.get('margin_initial',0.0)),
                     filled_tp1=bool(d.get('filled_tp1', False)),
                     closed=bool(d.get('closed', False)),
                     realized_pnl=float(d.get('realized_pnl', 0.0)),
@@ -570,7 +608,6 @@ def main():
 
     # ------------- helpers -------------
     def maybe_trail(pos: Position, df: pd.DataFrame):
-        nonlocal equity
         if args.manage != 'trail' or pos.closed: return None
         ema20 = float(df['ema20'].iloc[-1])
         note = None
@@ -601,39 +638,74 @@ def main():
 
     def open_paper_position(sym: str, d: Dict):
         nonlocal bank
-        # Доля от банка по силе сетапа (не риск на стоп)
-        rpct = risk_pct_from_score(int(d.get('score', 0)))
+        rpct = risk_pct_from_score(int(d.get('score', 0)))  # сила сетапа для alloc
+        entry = float(d['entry']); stop = float(d['stop'])
         if bank <= 0:
             return None
-        # не более свободного кэша
-        cost = bank * (rpct/100.0)
-        if cost < args.min_cost_usd:
-            return None
-        if cost > bank:
-            cost = bank
-        qty = cost / max(d['entry'], 1e-12)
-        if qty <= 0:
-            return None
-        bank -= cost
-        pos = Position(symbol=sym, direction=d['direction'], entry=d['entry'], stop=d['stop'],
-                       tp1=d['tp1'], tp2=d['tp2'], qty=qty, score=int(d.get('score', 0)), cost_initial=cost)
-        positions[sym] = pos
-        return pos, cost, rpct
+        if args.sizing == 'risk':
+            # фикс. риск по стопу
+            risk_usd = bank * (args.risk_pct/100.0)
+            dist = abs(entry - stop)
+            if dist <= 0:
+                return None
+            qty = risk_usd / dist
+            cost = entry * qty
+        else:
+            # аллокация капитала
+            cost = bank * (rpct/100.0)
+            qty = cost / max(entry, 1e-12)
+
+        if args.futures_margin:
+            # маржа = cost/leverage
+            required = cost / max(args.leverage, 1e-9)
+            if required < args.min_cost_usd:
+                return None
+            if required > bank:
+                scale = bank / required if required > 0 else 0.0
+                qty *= scale
+                cost = entry * qty
+                required = bank
+            if qty <= 0:
+                return None
+            bank -= required
+            pos = Position(symbol=sym, direction=d['direction'], entry=entry, stop=stop,
+                           tp1=d['tp1'], tp2=d['tp2'], qty=qty, score=int(d.get('score', 0)),
+                           cost_initial=cost, margin_initial=required)
+            positions[sym] = pos
+            return pos, required, (args.risk_pct if args.sizing=='risk' else rpct)
+        else:
+            # спот: списываем полную стоимость
+            if cost > bank:
+                qty = max(0.0, bank / max(entry, 1e-12))
+                cost = entry * qty
+            if qty <= 0 or cost < args.min_cost_usd:
+                return None
+            bank -= cost
+            pos = Position(symbol=sym, direction=d['direction'], entry=entry, stop=stop,
+                           tp1=d['tp1'], tp2=d['tp2'], qty=qty, score=int(d.get('score', 0)),
+                           cost_initial=cost, margin_initial=cost)
+            positions[sym] = pos
+            return pos, cost, (args.risk_pct if args.sizing=='risk' else rpct)
 
     def mark_and_stats(prices: Dict[str, float]):
         nonlocal equity, bank
-        unreal = 0.0; closed_count = 0
-        # проход по позициям: исполнение и расчёт mark-to-market
+        closed_count = 0
+        # исполнение частичных выходов
         for sym, pos in list(positions.items()):
             price = prices.get(sym, None)
             if price is None: continue
             pre_closed = pos.closed
             cash_delta = simulate_fill(pos, price)
-            if cash_delta != 0.0:
-                bank += cash_delta
+            if cash_delta != 0.0 and not args.futures_margin:
+                bank += cash_delta  # на споте возвращаются деньги от частичных продаж
             if pos.closed and not pre_closed:
                 closed_count += 1
-        # после возможных изменений пересчитываем used/free/unreal/equity
+                if args.futures_margin:
+                    # освободить оставшуюся маржу
+                    released = pos.margin_initial if not pos.filled_tp1 else pos.margin_initial*0.5
+                    bank += released
+
+        # пересчёт метрик
         used = 0.0
         unreal = 0.0
         for sym, pos in positions.items():
@@ -641,12 +713,26 @@ def main():
             price = prices.get(sym)
             if price is None: continue
             live_qty = pos.qty if not pos.filled_tp1 else pos.qty*0.5
-            live_cost = pos.cost_initial if not pos.filled_tp1 else pos.cost_initial*0.5
-            mv = price * live_qty
-            used += mv
-            unreal += (mv - live_cost)
+            if args.futures_margin:
+                # used = занятая маржа
+                used += pos.margin_initial if not pos.filled_tp1 else pos.margin_initial*0.5
+                # unreal = mark-to-market
+                if pos.direction == 'LONG':
+                    unreal += (price - pos.entry) * live_qty
+                else:
+                    unreal += (pos.entry - price) * live_qty
+            else:
+                # spot: used = рыночная стоимость живой части, unreal = MV - cost
+                mv = price * live_qty
+                used += mv
+                live_cost = pos.cost_initial if not pos.filled_tp1 else pos.cost_initial*0.5
+                unreal += (mv - live_cost)
+
         realized = sum(p.realized_pnl for p in positions.values())
-        equity = bank + used + realized
+        if args.futures_margin:
+            equity = bank + realized + unreal
+        else:
+            equity = bank + used
         free = max(0.0, bank)
         return unreal, closed_count, used, free
 
@@ -757,9 +843,8 @@ def main():
                 if extra:
                     text += f"\n\n<b>ИИ-комментарий:</b>\n{esc(extra)}"
 
-            # отправляем сигнал
             if args.tg_token and args.tg_chat:
-                tg_send(args.tg_token, args.tg_chat, text)
+                tg_safe_send(args.tg_token, args.tg_chat, text)
             else:
                 print(text)
 
@@ -770,23 +855,25 @@ def main():
             if args.paper_trade:
                 opened = open_paper_position(symbol, d_best)
                 if opened:
-                    pos, cost, rpct = opened
-                    open_msg = f'📈 Paper: открыт {esc(pos.direction)} {esc(symbol)}, qty={fmt_qty(pos.qty)}, cost=${cost:,.2f}, risk={rpct:.1f}%'
+                    pos, paid, rpct = opened
+                    open_msg = (f'📈 Paper: открыт {esc(pos.direction)} {esc(symbol)}, qty={fmt_qty(pos.qty)}, '
+                                + (f'margin=${paid:,.2f}, lev={args.leverage:.0f}x' if args.futures_margin else f'cost=${paid:,.2f}')
+                                + f', risk={rpct:.1f}%')
                 else:
                     reason = 'недостаточно Free' if bank <= args.min_cost_usd else f'размер сделки слишком мал (&lt;${args.min_cost_usd:.0f})'
                     open_msg = f'⚠️ Paper: пропуск входа по {esc(symbol)} — {reason}'
                 if args.tg_token and args.tg_chat:
-                    tg_send(args.tg_token, args.tg_chat, open_msg)
+                    tg_safe_send(args.tg_token, args.tg_chat, open_msg)
                 else:
                     print(open_msg)
 
-        # обновим статы (маркировка, эквити и т.д.)
+        # обновим статы
         unreal, closed_count, used, free = mark_and_stats(prices)
         if args.paper_trade:
             realized = sum(p.realized_pnl for p in positions.values())
             summary = build_stats_text(realized, unreal, equity, used, free)
             if args.tg_token and args.tg_chat:
-                tg_send(args.tg_token, args.tg_chat, summary)
+                tg_safe_send(args.tg_token, args.tg_chat, summary)
             else:
                 print(summary)
 
@@ -795,12 +882,11 @@ def main():
     restored_ok, restored_count = load_state()
     if restored_ok and args.paper_trade:
         start_msg = f'🔄 Восстановлено позиций: {restored_count}. Balance=${bank:,.2f}.'
-        if args.tg_token and args.tg_chat: tg_send(args.tg_token, args.tg_chat, start_msg)
+        if args.tg_token and args.tg_chat: tg_safe_send(args.tg_token, args.tg_chat, start_msg)
         else: print(start_msg)
 
     if args.once:
         n = cycle_once()
-        # сохранить состояние
         try: save_state()
         except: pass
         print(f'[info] Sent {n} alerts.')
